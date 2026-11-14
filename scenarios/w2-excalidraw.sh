@@ -251,6 +251,10 @@ prepare_models() {
   "${PY1[@]}" catalog --src "$src/$SCREEN_MODEL.toml" --out "$catalog/$SCREEN_MODEL.toml" --served "$SCREEN_SERVED" || return 3
   "${PY1[@]}" inferd-config --planner-id "$PLANNER_MODEL" --planner-url "http://127.0.0.1:$PLANNER_PORT" \
     --screen-id "$SCREEN_MODEL" --screen-url "http://127.0.0.1:$SCREEN_PORT" >"$AGENTS/config/inferd/inferd.toml" || return 3
+  if [ -n "${W2_START_MODE:-}" ]; then
+    mkdir -p "$AGENTS/config/docket"; printf '[agent]\nstart_mode = "%s"\n' "$W2_START_MODE" >"$AGENTS/config/docket/settings.toml"
+    note "(New conversations start in $W2_START_MODE.)"
+  fi
   mkdir -p "$CONFIG/cua"
   # The browser is allowed outright: nobody is here to answer, and the jail is the boundary.
   "${PY1[@]}" cuad-settings --app "$BROWSER_APP=ask" --steps "${W2_CUA_STEPS:-300}" --active-s "${W2_CUA_ACTIVE_S:-1800}" \
@@ -323,6 +327,7 @@ step_boot() {
   : >"$RUN/stamps.tsv"
   stamp start
   touch "$RUN/.start"
+  [ -n "${W2_CASEMENT_LOG:-}" ] && export CASEMENT_LOG="$W2_CASEMENT_LOG"
   start_compositor || return 1
   scratch_new
   AGENTS=$SCRATCH/agents
@@ -422,6 +427,15 @@ bus_has_owner() {
 }
 
 start_screen_helper() {
+  A11Y_ENV=()
+  if [ "${W2_A11Y:-0}" = 1 ]; then
+    in_app_env python3 -I "$SCEN_BUILD/a11y-bus.py" "$RUN/a11y.sock" >"$RUN/a11y-bus.log" 2>&1 </dev/null &
+    record a11y-bus $!
+    sleep 1
+    printf 'tier = "balanced"\na11y = "atspi"\n\n[settings]\nenabled = "off"\ndefault_mode = "auto"\nwait_max = 60000\nwait_total = 600000\nautopause = "on"\ntree_max_nodes = 400\nkeep_screens = "off"\nkeep_days = 7\n\n[settings.budget]\nsteps = 40\nactive = 1800000\nstall_frames = 3\nactions_per_min = 60\nmodel_failures = 2\nspend = 0\n\n[settings.settle]\nquiet = 250\ntimeout = 3000\n\n[backend]\nkind = "detect"\n' >"$RUN/cuad.toml"
+    A11Y_ENV=(CUAD_CONFIG="$RUN/cuad.toml")
+    note "(Accessibility tree on: at-spi bus started, cuad reads $RUN/cuad.toml.)"
+  fi
   cat >"$RUN/cuad-callers.toml" <<'EOF'
 [[caller]]
 app = "org.quire.Intents"
@@ -438,8 +452,8 @@ app = "org.quire.Shell"
 unit = "sill.service"
 role = "sheet_host"
 EOF
-  in_app_env bash -c 'mkdir -p "$1/proc/$$" "$1/proc/units"; printf "0::/user.slice/user-1000.slice/user@1000.service/app.slice/cuad.service\n" > "$1/proc/$$/cgroup"; echo $$ > "$1/proc/units/cuad.service"; exec env CUAD_TEST_PROC_ROOT="$1/proc" CUAD_TEST_SYSTEM_CALLERS="$2" "$3"' \
-    _ "$AGENTS" "$RUN/cuad-callers.toml" "$CUAD" >"$RUN/cuad.log" 2>&1 </dev/null &
+  in_app_env bash -c 'mkdir -p "$1/proc/$$" "$1/proc/units"; printf "0::/user.slice/user-1000.slice/user@1000.service/app.slice/cuad.service\n" > "$1/proc/$$/cgroup"; echo $$ > "$1/proc/units/cuad.service"; exec env CUAD_TEST_PROC_ROOT="$1/proc" CUAD_TEST_SYSTEM_CALLERS="$2" "${@:4}" "$3"' \
+    _ "$AGENTS" "$RUN/cuad-callers.toml" "$CUAD" "${A11Y_ENV[@]}" >"$RUN/cuad.log" 2>&1 </dev/null &
   local pid=$!
   record cuad "$pid"
   sleep 2
@@ -468,7 +482,7 @@ step_pages() {
   before=$("${TIMING[@]}" now)
   # Zen needs MOZ_LEGACY_PROFILES (its launcher sets it). The browser's own content sandbox cannot nest inside the jail's
   # and the jail is the boundary here, so it is off; no GPU, so pictures are drawn by software.
-  in_app_env env MOZ_LEGACY_PROFILES=1 MOZ_ENABLE_WAYLAND=1 MOZ_DISABLE_CONTENT_SANDBOX=1 MOZ_DISABLE_GMP_SANDBOX=1 \
+  in_app_env env $([ "${W2_A11Y:-0}" = 1 ] && echo GNOME_ACCESSIBILITY=1) MOZ_LEGACY_PROFILES=1 MOZ_ENABLE_WAYLAND=1 MOZ_DISABLE_CONTENT_SANDBOX=1 MOZ_DISABLE_GMP_SANDBOX=1 \
     MOZ_DISABLE_RDD_SANDBOX=1 MOZ_DISABLE_SOCKET_PROCESS_SANDBOX=1 LIBGL_ALWAYS_SOFTWARE=1 \
     "$BROWSER" --profile "$profile" --no-remote --name "$BROWSER_APP" "$LAMP_URL" "$DRAW_URL" \
     >"$RUN/browser.log" 2>&1 </dev/null &
@@ -516,7 +530,7 @@ window_seen() { # IDS AFTER_NS
 
 ASKED_NS=0 ASKED_EPOCH=0
 step_ask_and_wait() {
-  SENTENCE=$("${PY2[@]}" sentence)
+  SENTENCE=${W2_SENTENCE:-$("${PY2[@]}" sentence)}
   note "The assistant is asked: $SENTENCE"
   ASKED_NS=$("${TIMING[@]}" now) ASKED_EPOCH=$(date +%s)
   stamp asked
@@ -541,6 +555,14 @@ step_ask_and_wait() {
     fi
     if [ "$screen_seen" = no ] && "${PY1[@]}" first-screen --audit "$audit" --since "$ASKED_EPOCH" >/dev/null; then
       screen_seen=yes; stamp first_screen_step; snap first-screen-step; note "The screen helper has started looking at the window."
+    fi
+    # W2_SWITCH_TO: once the screen helper has started, flip every open session to that mode, as the person would mid-task.
+    if [ -n "${W2_SWITCH_TO:-}" ] && [ "$screen_seen" = yes ] && [ "${switched:-no}" = no ]; then
+      switched=yes; stamp mode_switched
+      for sid in $(python3 -I "$SCEN_BUILD/open-sessions.py" "$RUN/bus.jsonl"); do
+        sill debug mode "$sid" "$W2_SWITCH_TO" >>"$RUN/keys.log" 2>&1; note "Switched $sid to $W2_SWITCH_TO (exit $?)."
+      done
+      snap mode-switched
     fi
     if [ -s "$RUN/sheets.tsv" ] && [ "$(wc -l <"$RUN/sheets.tsv")" -gt "$last_sheets" ]; then
       last_sheets=$(wc -l <"$RUN/sheets.tsv"); snap "sheet-$last_sheets"; note "A sheet was answered ($last_sheets so far)."
