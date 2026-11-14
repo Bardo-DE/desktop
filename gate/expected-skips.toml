@@ -12,3 +12,20 @@ closes = "P2"
 scenario = "keycap-yields-and-regrabs"
 finding = "FD-06"
 closes = "P4"
+
+# The owner's first login of casement + sill (2026-10-15) found problems no scenario caught; these are the
+# scenarios written for them that cannot pass yet. Ids are placeholders until the merge applies the rows.
+
+# The wheel is delivered to a client after libinput's natural scrolling would have been applied, and the
+# jail's headless injection bypasses libinput: the default cannot be observed on a client. Closes with the
+# tty backend on a fake session (or a real libinput seam) in the jail.
+[[skip]]
+scenario = "pointer-natural-scroll"
+finding = "FD-L02"
+closes = "P4"
+
+# Ctrl+Alt+F3 -> casement's VT switch: the headless backend has no VT switch to report.
+[[skip]]
+scenario = "vt-switch-chord"
+finding = "FD-L03"
+closes = "P4"
